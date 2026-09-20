@@ -127,7 +127,15 @@ class StereoDic:
         zncc_threshold: float = 0.5,
         epipolar_band: float = 6.0,
         disparity_range: Tuple[float, float] = (-150.0, 150.0),
+        allow_poor_quality_calibration: bool = False,
     ):
+        if not calib.quality_ok and not allow_poor_quality_calibration:
+            raise ValueError(
+                "This StereoCalibration failed its quality checks and must not be "
+                "used for 3D DIC:\n- " + "\n- ".join(calib.quality_issues) +
+                "\nRe-calibrate with more/better views, or pass "
+                "allow_poor_quality_calibration=True to override at your own risk."
+            )
         self.calib = calib
         self.subset_radius = subset_radius
         self.grid_step = grid_step

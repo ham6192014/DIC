@@ -112,6 +112,45 @@ python3 examples/calibrate_stereo.py calib/left calib/right \
 corners). `--square-size` is the physical square size (mm) — this fixes the
 scale of every downstream 3D measurement, so measure it carefully.
 
+Left/right images are matched by the numeric ID in their filename
+(`L10.png` pairs with `R10.png`) via `match_stereo_pairs_by_filename`, not
+by list position — so upload/glob order can't silently mismatch a pair.
+Files with no matching number on the other side, or duplicate numbers, are
+reported rather than guessed at.
+
+**Calibration quality gate**: `calibrate_stereo` doesn't report success
+just because OpenCV returned without an exception. By default it raises
+`CalibrationQualityError` if the stereo RMS, any individual pair's
+reprojection error, or the number of valid views fails a threshold
+(`max_rms_error`, `max_pair_reproj_error`, `min_valid_views`) — the
+rejected `StereoCalibration` and its full diagnostics are still attached to
+the exception (`.calibration`, `.report`) for inspection. `StereoDic`
+independently refuses a `calibration.quality_ok == False` object unless you
+pass `allow_poor_quality_calibration=True`, so a bad calibration can't
+accidentally end up driving a 3D-DIC run just because it was loaded from a
+file saved earlier. The CLI's `--force` flag and the GUI's "use this
+calibration anyway" checkbox are the explicit opt-outs.
+
+Every calibration's `.report` (`StereoCalibrationReport`) carries per-pair
+diagnostics: which images were used vs. rejected and why, whether each
+image's corner order was flipped during canonicalization, and per-pair
+left/right reprojection error — printed by the CLI and shown as a table in
+the GUI's Stereo Calibration tab.
+
+**180-degree corner-ordering ambiguity**: a plain checkerboard looks
+identical rotated 180 degrees, so a detector can legally label either of
+two diagonally-opposite corners as index 0 in any given photo — perfectly
+fine for that camera's own mono calibration (labeling doesn't affect
+within-camera reprojection), but if the left and right image of one pose
+disagree, that pose's point correspondences are scrambled and can dominate
+the joint stereo RMS. This is resolved for every image automatically
+(`_canonicalize_corner_order` in `pydic/calibration.py`) using a property
+of the physical board, not the photo: the checkerboard square immediately
+next to corner 0 is a fixed color, and comparing it *against its neighbor
+in the same photo* — rather than a fixed absolute brightness threshold —
+keeps the decision correct even when left/right exposure, gain, or
+lighting differ, which a threshold-based check would get wrong.
+
 **If calibration reports too few valid views**: chessboard detection runs on
 a downscaled copy of each image internally (very high-resolution camera
 photos — tens of megapixels — can make the classical OpenCV detector miss

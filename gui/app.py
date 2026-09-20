@@ -26,7 +26,12 @@ except ImportError:
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from pydic.calibration import StereoCalibration, calibrate_stereo, preview_chessboard_detection
+from pydic.calibration import (
+    CalibrationQualityError,
+    StereoCalibration,
+    calibrate_stereo,
+    preview_chessboard_detection,
+)
 from pydic.io_utils import load_gray, load_sequence, save_fields_csv, save_points3d_csv
 from pydic.pipeline import Dic2D, StereoDic
 from pydic.visualization import plot_points_3d, plot_scalar_field, plot_vector_field
@@ -132,7 +137,8 @@ def chessboard_diagnostics(paths, pattern_size, key: str):
                 st.error(f"{name}: could not read file")
                 continue
             thumb = _corner_overlay_thumbnail(r["image"], pattern_size, r["corners"], r["found"])
-            st.image(thumb, caption=f"{'OK' if r['found'] else 'FAILED'}: {name}")
+            flip_note = " (order flipped)" if r.get("flipped") else ""
+            st.image(thumb, caption=f"{'OK' if r['found'] else 'FAILED'}{flip_note}: {name}")
 
 
 def diagnose_result(valid: np.ndarray, disp_magnitude: np.ndarray, is_3d: bool = False) -> None:
@@ -197,6 +203,42 @@ def roi_bbox_picker(image: np.ndarray, key: str):
     return [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
 
 
+def render_calibration_report(report) -> None:
+    """Per-pair diagnostics table: corner orientation, reprojection error,
+    and why any image was rejected — so a bad calibration is debuggable
+    instead of just a number."""
+    if report is None:
+        return
+
+    if report.unmatched_left or report.unmatched_right or report.duplicate_left_ids or report.duplicate_right_ids:
+        with st.expander("Filename-matching issues", expanded=True):
+            if report.unmatched_left:
+                st.warning(f"Left images with no matching right-image number: {report.unmatched_left}")
+            if report.unmatched_right:
+                st.warning(f"Right images with no matching left-image number: {report.unmatched_right}")
+            if report.duplicate_left_ids:
+                st.error(f"Left images sharing the same number: {report.duplicate_left_ids}")
+            if report.duplicate_right_ids:
+                st.error(f"Right images sharing the same number: {report.duplicate_right_ids}")
+
+    rows = []
+    for p in report.pairs:
+        rows.append({
+            "id": p.numeric_id,
+            "left": Path(p.left_path).name,
+            "right": Path(p.right_path).name,
+            "left found": p.left_found,
+            "right found": p.right_found,
+            "left flipped": p.left_flipped,
+            "right flipped": p.right_flipped,
+            "used": p.used,
+            "left err (px)": round(p.left_reproj_error_px, 4) if p.left_reproj_error_px is not None else None,
+            "right err (px)": round(p.right_reproj_error_px, 4) if p.right_reproj_error_px is not None else None,
+            "reject reason": p.reject_reason or "",
+        })
+    st.dataframe(rows, width="stretch")
+
+
 # --------------------------------------------------------------------- tabs
 
 def about_tab():
@@ -237,8 +279,17 @@ def calibration_tab():
         tmp_path = os.path.join(tempfile.mkdtemp(), "calib.json")
         with open(tmp_path, "wb") as f:
             f.write(loaded.getbuffer())
-        st.session_state["stereo_calib"] = StereoCalibration.load(tmp_path)
-        st.success("Calibration loaded from file.")
+        loaded_calib = StereoCalibration.load(tmp_path)
+        st.session_state["stereo_calib"] = loaded_calib
+        st.session_state["stereo_calib_allow_poor"] = False
+        if loaded_calib.quality_ok:
+            st.success("Calibration loaded from file.")
+        else:
+            st.warning(
+                "Calibration loaded from file, but it's marked as having failed quality "
+                "checks when it was created:\n- " + "\n- ".join(loaded_calib.quality_issues)
+                + "\nIt will not be usable for Stereo DIC unless explicitly overridden below."
+            )
 
     left_paths = image_source_picker("Left camera chessboard images", "calib_left", multiple=True)
     right_paths = image_source_picker("Right camera chessboard images", "calib_right", multiple=True)
@@ -264,27 +315,62 @@ def calibration_tab():
             chessboard_diagnostics(right_paths, (int(cols), int(rows)), "calib_right_diag")
 
     if st.button("Run stereo calibration", disabled=not (left_paths and right_paths)):
-        if len(left_paths) != len(right_paths):
-            st.error(f"Left ({len(left_paths)}) and right ({len(right_paths)}) image counts differ.")
-        else:
-            with st.spinner("Detecting chessboards and calibrating..."):
-                try:
-                    calib = calibrate_stereo(left_paths, right_paths, (int(cols), int(rows)), float(square_size))
-                except RuntimeError as e:
-                    st.error(f"{e} Use the 'Preview corner detection' panel above to see which images failed and why.")
-                    calib = None
-            if calib is not None:
+        st.session_state.pop("calib_hard_failure", None)
+        with st.spinner("Detecting chessboards and calibrating..."):
+            try:
+                calib = calibrate_stereo(left_paths, right_paths, (int(cols), int(rows)), float(square_size))
+            except CalibrationQualityError as e:
+                if e.calibration is None:
+                    # Failed before a calibration could even be computed (e.g. too
+                    # few readable/detected views) — nothing to override or use.
+                    st.session_state.pop("stereo_calib", None)
+                    st.session_state["calib_hard_failure"] = e
+                else:
+                    st.session_state["stereo_calib"] = e.calibration
+                    st.session_state["stereo_calib_allow_poor"] = False
+            else:
                 st.session_state["stereo_calib"] = calib
-                st.success("Calibration succeeded.")
+                st.session_state["stereo_calib_allow_poor"] = False
+
+    hard_failure: CalibrationQualityError | None = st.session_state.get("calib_hard_failure")
+    if hard_failure is not None:
+        st.error(f"Calibration could not be run: {hard_failure}")
+        if hard_failure.report is not None:
+            render_calibration_report(hard_failure.report)
 
     calib: StereoCalibration | None = st.session_state.get("stereo_calib")
     if calib is not None:
         st.subheader("Calibration result")
-        m1, m2, m3 = st.columns(3)
+        allowed_poor = st.session_state.get("stereo_calib_allow_poor", False)
+        if calib.quality_ok:
+            st.success("Calibration passed quality checks.")
+        elif allowed_poor:
+            st.warning(
+                "Using a calibration that failed quality checks (explicitly overridden):\n- "
+                + "\n- ".join(calib.quality_issues)
+            )
+        else:
+            st.error(
+                "This calibration failed quality checks and cannot be used for Stereo DIC "
+                "until explicitly overridden:\n- " + "\n- ".join(calib.quality_issues)
+            )
+            st.checkbox(
+                "I understand the risk: use this calibration anyway (not recommended)",
+                key="stereo_calib_allow_poor_checkbox",
+            )
+            if st.session_state.get("stereo_calib_allow_poor_checkbox") and st.button("Use this calibration anyway", key="use_loaded_anyway"):
+                st.session_state["stereo_calib_allow_poor"] = True
+                st.rerun()
+        m1, m2, m3, m4 = st.columns(4)
         m1.metric("Stereo RMS (px)", f"{calib.rms_error:.4f}")
         m2.metric("Cam1 RMS (px)", f"{calib.cam1.rms_error:.4f}")
         m3.metric("Cam2 RMS (px)", f"{calib.cam2.rms_error:.4f}")
-        st.write("Baseline T (mm):", calib.T.ravel().tolist())
+        m4.metric("Baseline (mm)", f"{calib.baseline_mm:.4f}")
+        st.write("Translation T (mm):", calib.T.ravel().tolist())
+
+        if calib.report is not None:
+            with st.expander("Per-pair calibration diagnostics", expanded=not calib.quality_ok):
+                render_calibration_report(calib.report)
 
         tmp_json = os.path.join(tempfile.mkdtemp(), "stereo_calib.json")
         calib.save(tmp_json)
@@ -379,6 +465,11 @@ def stereo_dic_tab():
     if calib is None:
         st.warning("Run or load a stereo calibration in the 'Stereo Calibration' tab first.")
         return
+    if not calib.quality_ok:
+        st.warning(
+            "The loaded calibration failed its quality checks (explicitly overridden in the "
+            "Stereo Calibration tab):\n- " + "\n- ".join(calib.quality_issues)
+        )
     st.caption(f"Using loaded calibration (stereo RMS {calib.rms_error:.4f} px).")
 
     ref1 = image_source_picker("Reference image - camera 1 (left)", "s_ref1", multiple=False)
@@ -408,6 +499,7 @@ def stereo_dic_tab():
                 calib, subset_radius=int(subset_radius), grid_step=int(grid_step),
                 zncc_threshold=float(zncc_thr), epipolar_band=float(epi_band),
                 disparity_range=(float(disp_min), float(disp_max)),
+                allow_poor_quality_calibration=st.session_state.get("stereo_calib_allow_poor", False),
             )
             with st.spinner("Matching left/right cameras at the reference frame..."):
                 dic.set_reference(ref1[0], ref2[0], roi_polygon=roi)
