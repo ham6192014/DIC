@@ -1,7 +1,25 @@
 # pydic
 
-Subset-based 2D and stereo (3D) Digital Image Correlation in Python, built as
-a library first — a GUI can be layered on top of `pydic.pipeline`.
+Subset-based 2D and stereo (3D) Digital Image Correlation in Python, with a
+`pydic.pipeline` library API and a Streamlit GUI (`gui/app.py`) on top of it.
+
+## Run the GUI
+
+```bash
+pip install -r requirements.txt
+streamlit run gui/app.py
+```
+
+This opens in your browser (default `http://localhost:8501`). It has four
+tabs: **About**, **Stereo Calibration** (chessboard calibration, save/load
+JSON), **2D DIC** (single camera), and **Stereo DIC** (two cameras, gated on
+having a calibration loaded). Each DIC tab lets you point at images either
+by uploading files or by typing a local folder path + filename pattern, set
+subset radius / grid step / thresholds, run, page through frames, view
+displacement/strain fields, and download all frames as a zipped CSV.
+
+If you'd rather not launch a browser app, the same functionality is
+available as plain Python (below) or via the `examples/*.py` CLI scripts.
 
 ## Why another DIC implementation
 
@@ -126,16 +144,18 @@ See `examples/run_stereo_dic.py` for a CLI wrapper.
 | `io_utils.py` | Image loading, ROI polygon picker, CSV/JSON I/O |
 | `visualization.py` | Matplotlib scatter/quiver/3D plots for quick inspection |
 
-## Building a GUI on top
+## Extending or replacing the GUI
 
-`pydic.pipeline.Dic2D` and `StereoDic` are the intended integration point:
-they take images/paths in and return plain NumPy arrays out (no plotting or
-file I/O side effects), so a GUI just needs to call `set_reference` /
-`run_sequence` / `compute_strain` from button handlers and render the
-returned arrays (`visualization.py` has ready-made Matplotlib renderers you
-can embed in a Qt/Tk canvas, or use as a reference for a custom renderer).
-`io_utils.select_roi_polygon` shows the interactive-picker pattern if you
-want a similar click-to-select ROI in your own canvas.
+`pydic.pipeline.Dic2D` and `StereoDic` are the integration point the shipped
+Streamlit app (`gui/app.py`) is built on: they take images/paths in and
+return plain NumPy arrays out (no plotting or file I/O side effects), so any
+other GUI toolkit (Qt/Tk/web) just needs to call `set_reference` /
+`run_sequence` / `compute_strain` from its own event handlers and render the
+returned arrays. `visualization.py` has ready-made Matplotlib renderers you
+can reuse or use as a reference. The current ROI picker is a rectangle
+(`gui/app.py`'s slider-based bbox); `io_utils.select_roi_polygon` shows the
+interactive-polygon pattern if you want to add free-form ROI drawing (e.g.
+via the `streamlit-drawable-canvas` package, or a canvas widget in Qt/Tk).
 
 ## Running the tests
 

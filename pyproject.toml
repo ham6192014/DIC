@@ -13,6 +13,7 @@ dependencies = [
     "opencv-python>=4.8",
     "matplotlib>=3.7",
     "pyyaml>=6.0",
+    "streamlit>=1.30",
 ]
 
 [tool.setuptools.packages.find]
