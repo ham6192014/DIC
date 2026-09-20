@@ -12,18 +12,30 @@ import sys
 import tempfile
 from pathlib import Path
 
+import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from pydic.calibration import StereoCalibration, calibrate_stereo
+from pydic.calibration import StereoCalibration, calibrate_stereo, preview_chessboard_detection
 from pydic.io_utils import load_gray, load_sequence, save_fields_csv, save_points3d_csv
 from pydic.pipeline import Dic2D, StereoDic
 from pydic.visualization import plot_points_3d, plot_scalar_field, plot_vector_field
 
-st.set_page_config(page_title="pydic - Digital Image Correlation", layout="wide")
+st.set_page_config(page_title="pydic - Digital Image Correlation", page_icon="\U0001F4D0", layout="wide")
+
+st.markdown(
+    """
+    <style>
+    #MainMenu, footer {visibility: hidden; height: 0;}
+    .block-container {padding-top: 1.5rem; padding-bottom: 2rem; max-width: 1200px;}
+    div[data-testid="stMetricValue"] {font-size: 1.4rem;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
 # ---------------------------------------------------------------- utilities
@@ -81,6 +93,39 @@ def zip_dir(directory: str) -> bytes:
     data = Path(archive_base + ".zip").read_bytes()
     os.remove(archive_base + ".zip")
     return data
+
+
+def _corner_overlay_thumbnail(image_bgr: np.ndarray, pattern_size, corners, found: bool, max_dim: int = 320) -> np.ndarray:
+    vis = image_bgr.copy()
+    if found and corners is not None:
+        cv2.drawChessboardCorners(vis, pattern_size, corners, found)
+    h, w = vis.shape[:2]
+    scale = max_dim / max(h, w)
+    vis = cv2.resize(vis, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+    return cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
+
+
+def chessboard_diagnostics(paths, pattern_size, key: str):
+    """Show a pass/fail grid with corner overlays so a failed calibration is
+    debuggable (wrong board size, glare, blur, board partly out of frame,
+    image too large for the old detector, ...) instead of a bare error."""
+    if not paths:
+        return
+    if not st.button("Preview corner detection", key=f"{key}_preview_btn"):
+        return
+    with st.spinner(f"Running detection on {len(paths)} image(s)..."):
+        results = preview_chessboard_detection(paths, pattern_size)
+    n_found = sum(r["found"] for r in results)
+    st.write(f"**{n_found}/{len(results)}** image(s) detected with a {pattern_size[0]}x{pattern_size[1]} inner-corner pattern.")
+    cols = st.columns(4)
+    for i, r in enumerate(results):
+        with cols[i % 4]:
+            name = Path(r["path"]).name
+            if r["image"] is None:
+                st.error(f"{name}: could not read file")
+                continue
+            thumb = _corner_overlay_thumbnail(r["image"], pattern_size, r["corners"], r["found"])
+            st.image(thumb, caption=f"{'OK' if r['found'] else 'FAILED'}: {name}")
 
 
 def roi_bbox_picker(image: np.ndarray, key: str):
@@ -146,6 +191,21 @@ def calibration_tab():
     rows = c2.number_input("Inner corners (rows)", min_value=2, value=6)
     square_size = c3.number_input("Square size (mm)", min_value=0.01, value=20.0)
 
+    with st.expander("Preview corner detection (debug a failed calibration here)"):
+        st.caption(
+            "Run this before calibrating if you're not sure the board size is "
+            "right, or after a failed calibration to see exactly which images "
+            "were rejected and why (wrong corner count, glare, blur, board "
+            "partly out of frame, ...)."
+        )
+        pc1, pc2 = st.columns(2)
+        with pc1:
+            st.write("Left camera")
+            chessboard_diagnostics(left_paths, (int(cols), int(rows)), "calib_left_diag")
+        with pc2:
+            st.write("Right camera")
+            chessboard_diagnostics(right_paths, (int(cols), int(rows)), "calib_right_diag")
+
     if st.button("Run stereo calibration", disabled=not (left_paths and right_paths)):
         if len(left_paths) != len(right_paths):
             st.error(f"Left ({len(left_paths)}) and right ({len(right_paths)}) image counts differ.")
@@ -154,7 +214,7 @@ def calibration_tab():
                 try:
                     calib = calibrate_stereo(left_paths, right_paths, (int(cols), int(rows)), float(square_size))
                 except RuntimeError as e:
-                    st.error(str(e))
+                    st.error(f"{e} Use the 'Preview corner detection' panel above to see which images failed and why.")
                     calib = None
             if calib is not None:
                 st.session_state["stereo_calib"] = calib

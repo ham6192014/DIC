@@ -14,24 +14,60 @@ def find_chessboard_corners(
     image: np.ndarray,
     pattern_size: Tuple[int, int],
     refine_win: Tuple[int, int] = (11, 11),
+    max_detect_dim: int = 1600,
 ) -> Tuple[bool, np.ndarray]:
     """Locate inner chessboard corners in a grayscale/BGR image.
 
     pattern_size is (n_cols, n_rows) of *inner* corners (squares - 1).
-    Returns (found, corners) with corners shape (N, 1, 2) float32, subpixel refined.
+    Returns (found, corners) with corners shape (N, 1, 2) float32, subpixel
+    refined on the full-resolution image.
+
+    Detection itself runs on a downscaled copy (`max_detect_dim` on the long
+    side): OpenCV's chessboard detectors are tuned for, and much faster and
+    more reliable on, moderate resolutions — very large source photos (tens
+    of megapixels) can make the classical detector miss the board entirely
+    or take a very long time. The modern findChessboardCornersSB detector is
+    tried first (noticeably more robust to uneven lighting/blur/perspective
+    than the classical one) with a fallback to it.
     """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
-    flags = (
-        cv2.CALIB_CB_ADAPTIVE_THRESH
-        | cv2.CALIB_CB_NORMALIZE_IMAGE
-        | cv2.CALIB_CB_FAST_CHECK
+    h, w = gray.shape
+    scale = min(1.0, max_detect_dim / max(h, w))
+    small = cv2.resize(gray, (int(round(w * scale)), int(round(h * scale))), interpolation=cv2.INTER_AREA) if scale < 1.0 else gray
+
+    found, corners = cv2.findChessboardCornersSB(
+        small, pattern_size, flags=cv2.CALIB_CB_EXHAUSTIVE | cv2.CALIB_CB_ACCURACY
     )
-    found, corners = cv2.findChessboardCorners(gray, pattern_size, flags=flags)
     if not found:
-        return False, corners
+        flags = cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE
+        found, corners = cv2.findChessboardCorners(small, pattern_size, flags=flags)
+    if not found:
+        return False, None
+
+    corners = (corners / scale).astype(np.float32)
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-4)
     corners = cv2.cornerSubPix(gray, corners, refine_win, (-1, -1), criteria)
     return True, corners
+
+
+def preview_chessboard_detection(
+    image_paths: Sequence[str], pattern_size: Tuple[int, int]
+) -> List[dict]:
+    """Run detection on each image without calibrating, for UI diagnostics.
+
+    Returns one dict per path: {path, found, image (BGR np.ndarray or None
+    if unreadable), corners (or None)}. Draw with cv2.drawChessboardCorners
+    to show the user exactly what was (or wasn't) detected.
+    """
+    results = []
+    for path in image_paths:
+        img = cv2.imread(str(path))
+        if img is None:
+            results.append({"path": path, "found": False, "image": None, "corners": None})
+            continue
+        found, corners = find_chessboard_corners(img, pattern_size)
+        results.append({"path": path, "found": found, "image": img, "corners": corners})
+    return results
 
 
 def _object_points(pattern_size: Tuple[int, int], square_size: float) -> np.ndarray:

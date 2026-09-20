@@ -94,6 +94,17 @@ python3 examples/calibrate_stereo.py calib/left calib/right \
 corners). `--square-size` is the physical square size (mm) — this fixes the
 scale of every downstream 3D measurement, so measure it carefully.
 
+**If calibration reports too few valid views**: chessboard detection runs on
+a downscaled copy of each image internally (very high-resolution camera
+photos — tens of megapixels — can make the classical OpenCV detector miss
+the board entirely or hang), with a fallback to the modern, more robust
+`findChessboardCornersSB` detector, so this should be rare. If it still
+happens, use the GUI's **Preview corner detection** panel (Stereo
+Calibration tab) — it runs detection on every image and shows a thumbnail
+with a pass/fail label and the detected corner overlay, so you can see
+directly whether the issue is a wrong `--cols`/`--rows` count, glare, blur,
+or the board partly out of frame, instead of just an error count.
+
 2. **Run stereo-DIC**:
 
 ```python
