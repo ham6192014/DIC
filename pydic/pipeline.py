@@ -126,7 +126,11 @@ class StereoDic:
         tol: float = 1e-4,
         zncc_threshold: float = 0.5,
         epipolar_band: float = 6.0,
-        disparity_range: Tuple[float, float] = (-150.0, 150.0),
+        disparity_range: Optional[Tuple[float, float]] = None,
+        auto_disparity_range: bool = True,
+        undistort_images: bool = True,
+        lr_consistency_px: float = 1.0,
+        max_epipolar_error_px: float = 2.0,
         allow_poor_quality_calibration: bool = False,
     ):
         if not calib.quality_ok and not allow_poor_quality_calibration:
@@ -137,15 +141,26 @@ class StereoDic:
                 "allow_poor_quality_calibration=True to override at your own risk."
             )
         self.calib = calib
+        self.undistort_images = undistort_images
+        # Epipolar geometry (R, T, E, F) describes an ideal pinhole relationship
+        # between the cameras; it's only actually valid on images that have had
+        # their own lens distortion removed first. Once we undistort every
+        # image (below), matching/triangulation must treat distortion as zero
+        # or it would be "corrected" a second time.
+        self._match_calib = calib.undistorted_for_matching() if undistort_images else calib
         self.subset_radius = subset_radius
         self.grid_step = grid_step
         self.track_kwargs = dict(max_iter=max_iter, tol=tol, zncc_threshold=zncc_threshold)
         self.stereo_match_kwargs = dict(
             epipolar_band=epipolar_band,
             disparity_range=disparity_range,
+            auto_disparity_range=auto_disparity_range,
+            lr_consistency_px=lr_consistency_px,
+            max_epipolar_error_px=max_epipolar_error_px,
             max_iter=max_iter,
             tol=tol,
         )
+        self.last_match_diagnostics = None
 
         self.ref_img1: Optional[np.ndarray] = None
         self.ref_img2: Optional[np.ndarray] = None
@@ -154,14 +169,18 @@ class StereoDic:
         self.stereo_valid: Optional[np.ndarray] = None
         self.neighbors: Optional[List[List[int]]] = None
 
+    def _prep_image(self, image: ImageLike, cam) -> np.ndarray:
+        gray = load_gray(image)
+        return cam.undistort_image(gray) if self.undistort_images else gray
+
     def set_reference(
         self,
         image1: ImageLike,
         image2: ImageLike,
         roi_polygon: Optional[Sequence[Tuple[float, float]]] = None,
     ) -> None:
-        self.ref_img1 = load_gray(image1)
-        self.ref_img2 = load_gray(image2)
+        self.ref_img1 = self._prep_image(image1, self.calib.cam1)
+        self.ref_img2 = self._prep_image(image2, self.calib.cam2)
         mask = polygon_to_mask(self.ref_img1.shape, roi_polygon) if roi_polygon else None
         self.points1, index_of = generate_grid(self.ref_img1.shape, self.grid_step, self.subset_radius, mask)
         self.neighbors = build_neighbors(index_of)
@@ -178,15 +197,16 @@ class StereoDic:
         n_done, n_total_points), stage being "camera1" or "camera2"."""
         if self.ref_img1 is None:
             raise RuntimeError("call set_reference() first")
-        frames1 = [load_gray(im) for im in images1]
-        frames2 = [load_gray(im) for im in images2]
+        frames1 = [self._prep_image(im, self.calib.cam1) for im in images1]
+        frames2 = [self._prep_image(im, self.calib.cam2) for im in images2]
 
-        self.points2, self.stereo_valid, frame_results = track_stereo_sequence(
-            self.calib, self.ref_img1, self.ref_img2, frames1, frames2,
+        self.points2, self.stereo_valid, frame_results, match_diag = track_stereo_sequence(
+            self._match_calib, self.ref_img1, self.ref_img2, frames1, frames2,
             self.points1, self.neighbors, subset_radius=self.subset_radius,
             stereo_match_kwargs=self.stereo_match_kwargs, track_kwargs=self.track_kwargs,
             progress_callback=progress_callback,
         )
+        self.last_match_diagnostics = match_diag
         return frame_results
 
     def compute_strain(

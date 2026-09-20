@@ -8,6 +8,7 @@ Everything else is exposed for building custom pipelines / a GUI on top.
 """
 
 from .calibration import (
+    CalibrationQualityError,
     CameraCalibration,
     StereoCalibration,
     calibrate_single_camera,
@@ -16,11 +17,18 @@ from .calibration import (
 from .subset import Subset
 from .correlation import ImageInterpolator, icgn_correlate, initial_guess_template_match
 from .tracking2d import track_reliability_guided, DicPointResult
-from .strain import compute_strain_2d, compute_strain_3d_surface
-from .stereo import stereo_match_reference, triangulate_points
+from .strain import StrainField, compute_strain_2d, compute_strain_3d_surface
+from .stereo import (
+    PointMatchDiagnostic,
+    StereoMatchDiagnostics,
+    estimate_disparity_range,
+    stereo_match_reference,
+    triangulate_points,
+)
 from .pipeline import Dic2D, StereoDic
 
 __all__ = [
+    "CalibrationQualityError",
     "CameraCalibration",
     "StereoCalibration",
     "calibrate_single_camera",
@@ -31,8 +39,12 @@ __all__ = [
     "initial_guess_template_match",
     "track_reliability_guided",
     "DicPointResult",
+    "StrainField",
     "compute_strain_2d",
     "compute_strain_3d_surface",
+    "PointMatchDiagnostic",
+    "StereoMatchDiagnostics",
+    "estimate_disparity_range",
     "stereo_match_reference",
     "triangulate_points",
     "Dic2D",

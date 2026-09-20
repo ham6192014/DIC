@@ -239,6 +239,69 @@ def render_calibration_report(report) -> None:
     st.dataframe(rows, width="stretch")
 
 
+def render_stereo_match_diagnostics(diag, ref_img1: Optional[np.ndarray]) -> None:
+    """Full stereo-matching diagnostics per the "few valid points must not
+    look like a reliable measurement" requirement: counts, rejection
+    reasons, quality-metric distributions, and a spatial accept/reject map
+    on the reference image so you can see exactly where and why matching
+    failed, not just an aggregate percentage."""
+    st.subheader("Stereo matching diagnostics")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Candidate points", diag.n_total)
+    m2.metric("Matched", diag.n_matched)
+    m3.metric("Valid fraction", f"{diag.valid_fraction*100:.1f}%")
+
+    if diag.valid_fraction < 0.2:
+        st.error(
+            f"Only {diag.valid_fraction*100:.1f}% of points matched. This is **not** a reliable "
+            "full-field measurement — treat any displacement/strain map from this run as "
+            "unreliable until matching is fixed (check the ROI actually covers a well-speckled, "
+            "in-focus region on both cameras; check the calibration is for this exact rig/lens "
+            "setting; try widening the epipolar band or loosening thresholds and see whether more "
+            "points actually converge with a good ZNCC and low epipolar/LR error, rather than "
+            "just accepting more low-quality matches)."
+        )
+    elif diag.valid_fraction < 0.5:
+        st.warning(f"Only {diag.valid_fraction*100:.1f}% of points matched — check the diagnostics below before trusting this result.")
+
+    st.caption(f"Disparity search range used: [{diag.disparity_range_used[0]:.1f}, {diag.disparity_range_used[1]:.1f}] px")
+
+    if diag.rejection_counts:
+        st.write("Rejection reasons (top 10):")
+        counts = sorted(diag.rejection_counts.items(), key=lambda kv: -kv[1])[:10]
+        st.dataframe([{"reason": r, "count": c} for r, c in counts], width="stretch")
+
+    with st.expander("Quality-metric distributions and spatial map", expanded=diag.valid_fraction < 0.5):
+        zncc = diag.array("zncc")
+        epi = diag.array("epipolar_error_px")
+        disp_x = diag.array("disparity_x")
+        accepted = np.array([p.accepted for p in diag.points])
+
+        fig, axes = plt.subplots(1, 3, figsize=(13, 3.5))
+        if np.any(np.isfinite(zncc)):
+            axes[0].hist(zncc[np.isfinite(zncc)], bins=30)
+        axes[0].set_title("ZNCC")
+        if np.any(np.isfinite(epi)):
+            axes[1].hist(epi[np.isfinite(epi)], bins=30)
+        axes[1].set_title("Epipolar residual (px)")
+        if np.any(np.isfinite(disp_x)):
+            axes[2].hist(disp_x[np.isfinite(disp_x)], bins=30)
+        axes[2].set_title("Disparity (px)")
+        fig.tight_layout()
+        st.pyplot(fig)
+
+        if ref_img1 is not None:
+            xs = np.array([p.x1 for p in diag.points])
+            ys = np.array([p.y1 for p in diag.points])
+            fig2, ax2 = plt.subplots(figsize=(7, 6))
+            ax2.imshow(ref_img1, cmap="gray")
+            ax2.scatter(xs[accepted], ys[accepted], c="lime", s=10, label=f"accepted ({accepted.sum()})")
+            ax2.scatter(xs[~accepted], ys[~accepted], c="red", s=10, label=f"rejected ({(~accepted).sum()})")
+            ax2.legend(loc="upper right")
+            ax2.set_title("Accepted / rejected points on reference image (camera 1)")
+            st.pyplot(fig2)
+
+
 # --------------------------------------------------------------------- tabs
 
 def about_tab():
@@ -482,10 +545,49 @@ def stereo_dic_tab():
     grid_step = c2.number_input("Grid step (px)", min_value=1, value=10, key="s_step")
     zncc_thr = c3.number_input("ZNCC threshold", min_value=0.0, max_value=1.0, value=0.5, step=0.05, key="s_zncc")
 
+    undistort = st.checkbox(
+        "Undistort images before matching (recommended)", value=True, key="s_undistort",
+        help="Epipolar geometry from calibration assumes an ideal (undistorted) pinhole model; "
+             "matching directly on raw distorted photos against it is a common cause of near-total "
+             "stereo-matching failure on real lenses.",
+    )
+
+    try:
+        exp_lo, exp_hi = calib.expected_disparity_range_px(100.0, 3000.0)
+        st.caption(
+            f"From this calibration's baseline ({calib.baseline_mm:.1f} mm) and focal length, expected "
+            f"disparity at 0.1-3m working distance spans roughly {exp_lo:.0f} to {exp_hi:.0f} px "
+            "(disparity ~= fx * baseline / Z) — a sanity reference, not the actual search range."
+        )
+    except Exception:
+        pass
+
+    auto_range = st.checkbox(
+        "Auto-detect disparity search range from the images (recommended)", value=True, key="s_auto_range",
+        help="Runs a coarse wide-range search on a sample of points first, instead of assuming a "
+             "fixed pixel window that may not cover the true correspondences.",
+    )
     c4, c5, c6 = st.columns(3)
-    disp_min = c4.number_input("Disparity range min (px)", value=-150.0, key="s_dmin")
-    disp_max = c5.number_input("Disparity range max (px)", value=150.0, key="s_dmax")
+    if not auto_range:
+        disp_min = c4.number_input("Disparity range min (px)", value=-150.0, key="s_dmin")
+        disp_max = c5.number_input("Disparity range max (px)", value=150.0, key="s_dmax")
+    else:
+        disp_min = disp_max = None
+        c4.caption("(auto)")
+        c5.caption("(auto)")
     epi_band = c6.number_input("Epipolar search band (px)", min_value=1.0, value=6.0, key="s_band")
+
+    c7, c8 = st.columns(2)
+    lr_tol = c7.number_input(
+        "Max left-right consistency error (px)", min_value=0.1, value=1.0, step=0.1, key="s_lr_tol",
+        help="Reject a match if correlating cam2 -> cam1 doesn't return within this distance of the "
+             "original point. Catches plausible-looking but wrong matches (repetitive texture).",
+    )
+    max_epi_err = c8.number_input(
+        "Max epipolar residual (px)", min_value=0.1, value=2.0, step=0.1, key="s_max_epi",
+        help="Reject a match if its final (subpixel-refined) location is farther than this from the "
+             "epipolar line predicted by calibration.",
+    )
 
     roi = None
     if ref1:
@@ -498,7 +600,11 @@ def stereo_dic_tab():
             dic = StereoDic(
                 calib, subset_radius=int(subset_radius), grid_step=int(grid_step),
                 zncc_threshold=float(zncc_thr), epipolar_band=float(epi_band),
-                disparity_range=(float(disp_min), float(disp_max)),
+                disparity_range=None if auto_range else (float(disp_min), float(disp_max)),
+                auto_disparity_range=auto_range,
+                undistort_images=undistort,
+                lr_consistency_px=float(lr_tol),
+                max_epipolar_error_px=float(max_epi_err),
                 allow_poor_quality_calibration=st.session_state.get("stereo_calib_allow_poor", False),
             )
             with st.spinner("Matching left/right cameras at the reference frame..."):
@@ -524,6 +630,11 @@ def stereo_dic_tab():
 
     dic: StereoDic | None = st.session_state.get("stereo_dic")
     frame_results = st.session_state.get("stereo_dic_results")
+
+    match_diag = getattr(dic, "last_match_diagnostics", None) if dic is not None else None
+    if match_diag is not None:
+        render_stereo_match_diagnostics(match_diag, dic.ref_img1)
+
     if dic is not None and frame_results:
         frame_idx = (
             st.slider("Frame", 1, len(frame_results), 1, key="s_frame") - 1

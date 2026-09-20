@@ -95,6 +95,30 @@ def compute_strain_2d(
     return StrainField(exx, eyy, exy, out_valid)
 
 
+def _local_tangent_basis(rel: np.ndarray) -> np.ndarray:
+    """Orthonormal in-plane basis (e1, e2) for a local 3D neighborhood `rel`
+    (points relative to the center point), from the least-variance (normal)
+    direction of its own best-fit plane. e1/e2 are global-X/Y projected onto
+    that plane and Gram-Schmidt'd, which is invariant to the sign ambiguity
+    of the PCA normal (unlike cross(normal, e1)), so the basis is consistent
+    point-to-point without needing to resolve that sign.
+    """
+    _, _, vt = np.linalg.svd(rel, full_matrices=False)
+    normal = vt[2] if vt.shape[0] > 2 else np.cross(vt[0], vt[1])
+
+    global_x = np.array([1.0, 0.0, 0.0])
+    global_y = np.array([0.0, 1.0, 0.0])
+    e1 = global_x - np.dot(global_x, normal) * normal
+    if np.linalg.norm(e1) < 0.2:
+        e1 = global_y - np.dot(global_y, normal) * normal
+    e1 /= np.linalg.norm(e1)
+    e2 = global_y - np.dot(global_y, e1) * e1 - np.dot(global_y, normal) * normal
+    if np.linalg.norm(e2) < 1e-6:
+        e2 = global_x - np.dot(global_x, e1) * e1 - np.dot(global_x, normal) * normal
+    e2 /= np.linalg.norm(e2)
+    return np.column_stack([e1, e2])  # (3, 2)
+
+
 def compute_strain_3d_surface(
     ref_points_3d: np.ndarray,
     cur_points_3d: np.ndarray,
@@ -106,27 +130,34 @@ def compute_strain_3d_surface(
 ) -> StrainField:
     """Surface (Lagrangian) strain on a triangulated 3D point cloud.
 
-    For each point, a local tangent-plane *normal* is estimated from the
-    reference (undeformed) neighborhood via PCA (the least-variance
-    direction). The in-plane axes are then taken as the global X/Y axes
-    projected onto that tangent plane (falling back to Y/Z if the normal is
-    nearly parallel to X), rather than the PCA's own in-plane singular
-    vectors: PCA leaves the in-plane rotation, and the sign of each axis,
-    arbitrary per point, which would make exx/eyy/exy meaningless to compare
-    or plot across the field even though rotation-invariant quantities
-    (principal strains, von Mises) come out correct either way. Projecting a
-    fixed global direction instead gives a basis that varies smoothly across
-    a gently curved surface, so exx/eyy/exy stay physically comparable
-    point-to-point.
+    For each point, in-plane 2D coordinates are obtained by projecting the
+    local neighborhood onto its own best-fit tangent plane — separately for
+    the reference and current configurations (see _local_tangent_basis).
+    Projecting onto each configuration's *own* tangent plane, rather than
+    reusing the reference plane for both, is essential: a surface subjected
+    to a rigid rotation (in particular an out-of-plane one) tilts its local
+    tangent plane along with it, and projecting the *already-rotated*
+    current neighborhood onto the *old*, unrotated reference plane
+    foreshortens it (exactly like a tilted card's shadow being shorter than
+    the card) — a pure geometry artifact, not physical strain, that for a
+    rotation of angle theta produces a fictitious normal strain of
+    0.5*(cos^2(theta) - 1) even though the true Green-Lagrange strain of a
+    rigid motion is exactly zero. Using each configuration's own tangent
+    plane makes the in-plane 2D coordinates faithfully represent that
+    configuration's true (undistorted) local geometry, so a rigid rotation
+    of any angle — in-plane or out-of-plane — now gives exactly zero strain
+    (verified in tests/test_strain_3d.py), with no small-angle assumption:
+    the current-plane in-plane coordinates are only defined up to an
+    arbitrary in-plane rotation Q of their own (the tangent-plane basis
+    isn't tied to the reference orientation), but the Green-Lagrange tensor
+    E = 0.5(F^T F - I) is invariant to that choice, since replacing F with
+    Q@F leaves F^T F unchanged for any orthogonal Q.
     """
     n = len(ref_points_3d)
     exx = np.full(n, np.nan)
     eyy = np.full(n, np.nan)
     exy = np.full(n, np.nan)
     out_valid = np.zeros(n, dtype=bool)
-
-    global_x = np.array([1.0, 0.0, 0.0])
-    global_y = np.array([0.0, 1.0, 0.0])
 
     for i in range(n):
         if not valid[i]:
@@ -137,27 +168,13 @@ def compute_strain_3d_surface(
         idxs = np.array(idxs)
 
         ref_rel = ref_points_3d[idxs] - ref_points_3d[i]
-        _, _, vt = np.linalg.svd(ref_rel, full_matrices=False)
-        normal = vt[2] if vt.shape[0] > 2 else np.cross(vt[0], vt[1])
-
-        # Project global X and Y onto the tangent plane and Gram-Schmidt them
-        # into an orthonormal in-plane basis. Unlike cross(normal, e1), this
-        # is invariant to the sign of `normal` (PCA/SVD only determines it up
-        # to +/-), so the basis orientation stays consistent across every
-        # point without needing to resolve that sign first.
-        e1 = global_x - np.dot(global_x, normal) * normal
-        if np.linalg.norm(e1) < 0.2:
-            e1 = global_y - np.dot(global_y, normal) * normal
-        e1 /= np.linalg.norm(e1)
-        e2 = global_y - np.dot(global_y, e1) * e1 - np.dot(global_y, normal) * normal
-        if np.linalg.norm(e2) < 1e-6:
-            e2 = global_x - np.dot(global_x, e1) * e1 - np.dot(global_x, normal) * normal
-        e2 /= np.linalg.norm(e2)
-
-        ref_2d = np.column_stack([ref_rel @ e1, ref_rel @ e2])
-
         cur_rel = cur_points_3d[idxs] - cur_points_3d[i]
-        cur_2d = np.column_stack([cur_rel @ e1, cur_rel @ e2])
+
+        ref_basis = _local_tangent_basis(ref_rel)
+        cur_basis = _local_tangent_basis(cur_rel)
+
+        ref_2d = ref_rel @ ref_basis
+        cur_2d = cur_rel @ cur_basis
 
         A = np.column_stack([np.ones(len(idxs)), ref_2d[:, 0], ref_2d[:, 1]])
         cx, *_ = np.linalg.lstsq(A, cur_2d[:, 0], rcond=None)

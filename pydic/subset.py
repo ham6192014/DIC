@@ -79,6 +79,12 @@ def build_subset(
     reference image (see correlation.image_gradients), reused across subsets.
     """
     h, w = ref_image_gray.shape
+    if not (np.isfinite(x0) and np.isfinite(y0)):
+        return Subset(
+            x0, y0, radius,
+            *([np.zeros(0)] * 5), 0.0, np.zeros(0), 0.0,
+            np.zeros((0, N_PARAMS)), np.zeros((N_PARAMS, N_PARAMS)), False,
+        )
     xi = int(round(x0))
     yi = int(round(y0))
     x_lo, x_hi = xi - radius, xi + radius

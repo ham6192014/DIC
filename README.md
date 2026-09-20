@@ -185,10 +185,43 @@ for fr in frame_results:
 
 See `examples/run_stereo_dic.py` for a CLI wrapper.
 
-### If matching/tracking struggles
+### Stereo matching robustness
 
-- **Large baseline / disparity**: widen `StereoDic(..., disparity_range=(min, max))`
-  (pixels) to cover the true disparity at your working distance.
+`StereoDic` (and the underlying `pydic.stereo.stereo_match_reference`) do the
+following, all on by default, aimed specifically at the failure mode of "runs
+without error but almost nothing matches":
+
+- **Undistort before matching** (`undistort_images=True`). The fundamental
+  matrix / R,T from calibration describe an ideal pinhole relationship
+  between the cameras; that's only actually true once each image's own lens
+  distortion has been removed. Matching directly on raw distorted photos
+  against a pinhole-model epipolar line is one of the most common reasons a
+  rig calibrates fine (good RMS) but then fails to find real correspondences,
+  and gets systematically worse toward the image edges.
+- **Data-driven disparity search range** (`auto_disparity_range=True`).
+  Instead of assuming a fixed pixel window, a coarse wide-range search on a
+  sample of points estimates the actual disparity range first. A fixed
+  window that doesn't cover your rig's true disparity (common with a wide
+  baseline or close working distance — `StereoCalibration.expected_disparity_range_px()`
+  gives a sanity-check estimate from the calibration's own baseline/focal
+  length) silently misses nearly every correspondence rather than erroring.
+- **Explicit epipolar-distance rejection** (`max_epipolar_error_px`,
+  default 2px): the final subpixel-refined match must actually be near the
+  epipolar line, not just have started a search near it.
+- **Left-right consistency check** (`lr_consistency_px`, default 1px):
+  correlating the found camera-2 point back to camera 1 must return close to
+  the original point. Catches locally-plausible but geometrically wrong
+  matches (repetitive texture, aliasing) that ZNCC alone would accept.
+- **Full diagnostics, always**: every `StereoDic.run_sequence()` call
+  populates `.last_match_diagnostics` (a `StereoMatchDiagnostics`) with
+  per-point accept/reject status and reason, ZNCC/epipolar/disparity
+  distributions, and counts — shown in the GUI as a table, histograms, and a
+  spatial accept/reject overlay on the reference image. A low valid fraction
+  is flagged as **not** a reliable full-field measurement rather than shown
+  as if it were one.
+
+If matching still struggles:
+
 - **Large deformation on frame 1**: `Dic2D.run_sequence(..., seed_xy=(x, y))`
   or `StereoDic`'s equivalent lets you bootstrap a coarse initial guess from
   template matching instead of assuming near-zero motion.
@@ -196,6 +229,21 @@ See `examples/run_stereo_dic.py` for a CLI wrapper.
   for high-contrast, isotropic, non-repeating speckles at 3-5 px per
   speckle at your imaging resolution. A poor pattern will make *any* DIC
   code — this one included — perform worse than expected.
+
+### 3D surface strain: what "surface strain" means here
+
+`compute_strain_3d_surface` computes the Green-Lagrange strain tensor
+`E = 0.5*(FᵀF - I)` of the deformation gradient `F` mapping each point's
+local reference tangent-plane coordinates to its local *current*
+tangent-plane coordinates — both fit independently from each configuration's
+own local neighborhood (not the reference plane reused for both), which is
+what makes a rigid rotation of any angle, in-plane or out-of-plane, come out
+as exactly zero strain (see `tests/test_strain_3d.py`, including the exact
+30-degree-out-of-plane case that a previous version of this formula got
+wrong by projecting the deformed, rotated neighborhood onto the old
+reference plane — a foreshortening artifact, not physical strain). Strain is
+only computed where a point and enough of its neighbors are valid; it is
+never interpolated across missing points or discontinuities.
 
 ## Package layout
 

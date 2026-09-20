@@ -388,6 +388,34 @@ class CameraCalibration:
             rms_error=d["rms_error"],
         )
 
+    def _undistort_maps(self, image_size: Tuple[int, int]):
+        cache = getattr(self, "_remap_cache", None)
+        if cache is not None and cache[0] == image_size:
+            return cache[1], cache[2]
+        map1, map2 = cv2.initUndistortRectifyMap(
+            self.camera_matrix, self.dist_coeffs, None, self.camera_matrix, image_size, cv2.CV_32FC1
+        )
+        self._remap_cache = (image_size, map1, map2)
+        return map1, map2
+
+    def undistort_image(self, gray: np.ndarray) -> np.ndarray:
+        """Remove lens distortion, keeping the same camera_matrix (so pixel
+        coordinates on the output image are directly comparable to this
+        calibration's K — no separate "new K" bookkeeping needed downstream).
+
+        This must run before any correlation/matching that relies on
+        epipolar geometry from the calibration: the fundamental/essential
+        matrix (and R, T) describe an ideal pinhole relationship between the
+        two cameras, which is only actually true once each image's own lens
+        distortion has been removed. Matching directly on raw (distorted)
+        photos against an epipolar line computed from the pinhole model is
+        the single most common reason a stereo-DIC rig calibrates fine but
+        then fails to find real-world correspondences.
+        """
+        h, w = gray.shape[:2]
+        map1, map2 = self._undistort_maps((w, h))
+        return cv2.remap(gray, map1, map2, interpolation=cv2.INTER_LINEAR)
+
 
 def calibrate_single_camera(
     image_paths: Sequence[str],
@@ -447,6 +475,38 @@ class StereoCalibration:
     def baseline_mm(self) -> float:
         """Magnitude of the translation between the two camera centers."""
         return float(np.linalg.norm(self.T))
+
+    def expected_disparity_range_px(self, z_min_mm: float, z_max_mm: float) -> Tuple[float, float]:
+        """Expected horizontal-pixel disparity magnitude at a given working-
+        distance range, from disparity ~= fx * baseline / Z (the standard
+        stereo relation): a sanity check / starting point for the matching
+        search range, instead of guessing a fixed pixel window. Assumes cam2
+        is offset from cam1 mostly along its own X axis; for a strongly
+        verged/rotated rig this is only an order-of-magnitude estimate — the
+        actual search range used by stereo matching is refined further by a
+        coarse data-driven pass (see stereo.estimate_disparity_range).
+        """
+        if z_min_mm <= 0 or z_max_mm <= 0:
+            raise ValueError("working distances must be positive")
+        fx = float(self.cam1.camera_matrix[0, 0])
+        baseline = self.baseline_mm
+        d_far = fx * baseline / z_max_mm
+        d_near = fx * baseline / z_min_mm
+        return (min(d_far, d_near), max(d_far, d_near))
+
+    def undistorted_for_matching(self) -> "StereoCalibration":
+        """A copy with zero distortion coefficients, for use once images
+        have already been undistorted with cam1/cam2.undistort_image() —
+        keeps K, R, T, E, F (none of which depend on the distortion model)
+        so downstream epipolar geometry and triangulation stay consistent
+        with the now-undistorted pixel coordinates."""
+        cam1 = CameraCalibration(self.cam1.camera_matrix, np.zeros(5), self.cam1.image_size, self.cam1.rms_error)
+        cam2 = CameraCalibration(self.cam2.camera_matrix, np.zeros(5), self.cam2.image_size, self.cam2.rms_error)
+        return StereoCalibration(
+            cam1=cam1, cam2=cam2, R=self.R, T=self.T, E=self.E, F=self.F, rms_error=self.rms_error,
+            P1=self.P1, P2=self.P2, quality_ok=self.quality_ok, quality_issues=self.quality_issues,
+            report=self.report,
+        )
 
     def save(self, path: str) -> None:
         d = {
