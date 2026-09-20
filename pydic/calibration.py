@@ -47,7 +47,44 @@ def find_chessboard_corners(
     corners = (corners / scale).astype(np.float32)
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-4)
     corners = cv2.cornerSubPix(gray, corners, refine_win, (-1, -1), criteria)
+    corners = _canonicalize_corner_order(gray, corners, pattern_size)
     return True, corners
+
+
+def _canonicalize_corner_order(
+    gray: np.ndarray, corners: np.ndarray, pattern_size: Tuple[int, int]
+) -> np.ndarray:
+    """Fix the classic checkerboard 180-degree labeling ambiguity.
+
+    A plain checkerboard looks identical rotated 180 degrees, so the
+    detector's choice of "corner index 0" is only fixed relative to how the
+    board happened to appear in *that* image — nothing stops it from picking
+    the diagonally opposite physical corner in another image of the same
+    pose (this is exactly what caused a real stereo calibration to fail with
+    a huge RMS despite both individual cameras calibrating fine: reprojection
+    error within one camera doesn't care about labeling, but stereoCalibrate
+    needs corner k in the left image and corner k in the right image to be
+    the *same physical point*, for every pose).
+
+    Fixed with a property that doesn't depend on viewpoint at all: the real
+    checkerboard square diagonally adjacent to corner 0 is either black or
+    white, a fact about the physical board, not the photo. Sampling it and
+    enforcing a single reference color (black) for every image, of every
+    camera, of every pose makes the labeling agree everywhere automatically.
+    """
+    cols, rows = pattern_size
+    grid = corners.reshape(rows, cols, 2)
+    c00, c01, c10, c11 = grid[0, 0], grid[0, 1], grid[1, 0], grid[1, 1]
+    center = (c00 + c01 + c10 + c11) / 4.0
+    x, y = int(round(center[0])), int(round(center[1]))
+    h, w = gray.shape
+    x0, x1 = max(0, x - 3), min(w, x + 4)
+    y0, y1 = max(0, y - 3), min(h, y + 4)
+    patch = gray[y0:y1, x0:x1]
+    is_dark = patch.size > 0 and float(patch.mean()) < 128.0
+    if not is_dark:
+        grid = grid[::-1, ::-1, :]
+    return grid.reshape(rows * cols, 1, 2).astype(np.float32)
 
 
 def preview_chessboard_detection(

@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 
-from pydic.calibration import calibrate_stereo, find_chessboard_corners
+from pydic.calibration import _canonicalize_corner_order, calibrate_stereo, find_chessboard_corners
 
 
 def _render_chessboard(rvec, tvec, K, D, img_size, cols, rows, square):
@@ -76,3 +76,41 @@ def test_calibrate_stereo_recovers_known_baseline(tmp_path):
     calib = calibrate_stereo(left_paths, right_paths, (cols, rows), square)
     assert calib.rms_error < 1.0
     assert abs(calib.T.ravel()[0] - (-150.0)) < 5.0
+
+
+def test_canonicalization_resolves_180_degree_labeling_ambiguity():
+    # A plain checkerboard is visually symmetric under 180-degree rotation,
+    # so a detector can legally label either of two diagonally-opposite
+    # corners as index 0. This is exactly the failure mode behind a real
+    # bug report: two individually-fine mono calibrations (each doesn't
+    # care about labeling) but a stereo RMS of ~150px, because one image of
+    # a pose got the "opposite" labeling from its pair. Simulate that here:
+    # detect once normally, once with the raw order reversed (standing in
+    # for the other camera picking the opposite corner), and confirm
+    # canonicalizing both converges on the identical physical labeling.
+    cols, rows, square = 9, 6, 25.0
+    square_px = 220
+    margin = square_px * 2
+    board_w = (cols + 1) * square_px + 2 * margin
+    board_h = (rows + 1) * square_px + 2 * margin
+    img = np.full((board_h, board_w), 255, dtype=np.uint8)
+    for r in range(rows + 1):
+        for c in range(cols + 1):
+            if (r + c) % 2 == 0:
+                continue
+            y0, x0 = margin + r * square_px, margin + c * square_px
+            img[y0:y0 + square_px, x0:x0 + square_px] = 0
+
+    found, raw = cv2.findChessboardCornersSB(
+        img, (cols, rows), flags=cv2.CALIB_CB_EXHAUSTIVE | cv2.CALIB_CB_ACCURACY
+    )
+    assert found
+    raw = cv2.cornerSubPix(
+        img, raw.astype(np.float32), (11, 11), (-1, -1),
+        (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-4),
+    )
+    flipped_raw = raw[::-1].copy()
+
+    canon_normal = _canonicalize_corner_order(img, raw, (cols, rows))
+    canon_flipped = _canonicalize_corner_order(img, flipped_raw, (cols, rows))
+    assert np.allclose(canon_normal, canon_flipped)
