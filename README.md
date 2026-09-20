@@ -18,6 +18,18 @@ by uploading files or by typing a local folder path + filename pattern, set
 subset radius / grid step / thresholds, run, page through frames, view
 displacement/strain fields, and download all frames as a zipped CSV.
 
+**Selecting the ROI**: check "Restrict to a rectangular ROI" to get an
+interactive crop box you drag directly on the reference image (requires
+`streamlit-cropper`, in requirements.txt) — a preview of exactly what's
+inside the box is shown below it, so you can confirm it actually covers the
+speckled/textured region before running. This matters: DIC has nothing to
+correlate against a flat, dark, or untextured area, and a run over such a
+region will "succeed" while reporting ~0 displacement everywhere, which is
+easy to mistake for a bug rather than a targeting problem. A run shows a
+live progress bar (points resolved so far) rather than a bare spinner, and
+if the result comes back with near-zero convergence or near-zero
+displacement, the app tells you directly instead of leaving you to guess.
+
 If you'd rather not launch a browser app, the same functionality is
 available as plain Python (below) or via the `examples/*.py` CLI scripts.
 
@@ -35,6 +47,12 @@ the same core algorithms used by the serious (often commercial) tools:
   normalized sum-of-squared-differences (ZNSSD) criterion (robust to
   linear brightness/contrast changes). This is the algorithm behind
   Ncorr/VIC-2D/VIC-3D-class accuracy (see Pan, Li & Xie, *Exp. Mech.* 2013).
+  Interpolation is done with small *local* splines built per subset rather
+  than one spline over the whole frame — scipy's spline evaluation cost
+  scales with the whole image's resolution regardless of how few points you
+  query, so on a multi-megapixel camera photo a naive global spline can make
+  correlation take minutes; local interpolation keeps it fast independent
+  of the surrounding image's resolution.
 - **Reliability-guided propagation (RG-DIC)** — subsets are correlated
   starting from a seed and grown outward, always expanding next from the
   most-reliable (highest ZNCC) converged point, using its warp as the

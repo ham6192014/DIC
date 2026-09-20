@@ -17,7 +17,7 @@ from __future__ import annotations
 import heapq
 import itertools
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -56,6 +56,7 @@ def track_reliability_guided(
     zncc_threshold: float = 0.5,
     interpolator: Optional[ImageInterpolator] = None,
     grad: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> List[DicPointResult]:
     """Propagate subset correlation across `points` from `seed_indices`.
 
@@ -64,6 +65,9 @@ def track_reliability_guided(
     seed_p_init: initial 6-param guess per seed (defaults to zero, i.e. small
         deformation assumed at the seed; for large motion, provide a guess
         e.g. from correlation.initial_guess_template_match).
+    progress_callback: optional callback(n_done, n_total), called after each
+        point is resolved — this loop can take tens of seconds on a large
+        grid, so a GUI needs a way to show it's actually progressing.
     """
     n = len(points)
     if seed_p_init is None:
@@ -75,6 +79,7 @@ def track_reliability_guided(
     results: List[Optional[DicPointResult]] = [None] * n
     computed = np.zeros(n, dtype=bool)
     subset_cache: Dict[int, Subset] = {}
+    n_done = 0
 
     counter = itertools.count()  # tie-breaker so heap never compares arrays
     heap: List[Tuple[float, int, int, np.ndarray]] = []
@@ -94,14 +99,20 @@ def track_reliability_guided(
 
         if not subset.valid:
             computed[idx] = True
+            n_done += 1
             results[idx] = DicPointResult(idx, x0, y0, p_init, -1.0, False)
+            if progress_callback is not None:
+                progress_callback(n_done, n)
             continue
 
         res = icgn_correlate(
             subset, interp, p_init, max_iter=max_iter, tol=tol, zncc_threshold=zncc_threshold
         )
         computed[idx] = True
+        n_done += 1
         results[idx] = DicPointResult(idx, x0, y0, res.p, res.zncc, res.converged)
+        if progress_callback is not None:
+            progress_callback(n_done, n)
 
         if res.converged:
             for nb in neighbors[idx]:
@@ -125,6 +136,7 @@ def track_sequence(
     subset_radius: int,
     first_frame_seed_indices: Optional[Sequence[int]] = None,
     first_frame_seed_p: Optional[Sequence[np.ndarray]] = None,
+    frame_progress_callback: Optional[Callable[[int, int, int, int], None]] = None,
     **kwargs,
 ) -> List[List[DicPointResult]]:
     """Track every grid point across an image sequence, always correlating
@@ -140,6 +152,10 @@ def track_sequence(
     for the first frame (assumes the first deformed frame is close to the
     reference). Pass a single seed with an initial guess from
     correlation.initial_guess_template_match for large rigid-body motion.
+
+    frame_progress_callback: optional callback(frame_idx, n_frames, n_done,
+        n_total_points), for a GUI to show progress on what can be a
+        multi-second-to-minute operation on a large grid/sequence.
     """
     n = len(points)
     gx, gy = image_gradients(ref_gray)
@@ -157,9 +173,15 @@ def track_sequence(
             seeds = list(range(n))
             seed_p = [last_p[i] for i in seeds]
 
+        point_cb = None
+        if frame_progress_callback is not None:
+            point_cb = lambda n_done, n_total, fi=frame_idx: frame_progress_callback(
+                fi, len(frames), n_done, n_total
+            )
+
         res = track_reliability_guided(
             ref_gray, frame, points, neighbors, subset_radius, seeds, seed_p,
-            interpolator=interp, grad=(gx, gy), **kwargs,
+            interpolator=interp, grad=(gx, gy), progress_callback=point_cb, **kwargs,
         )
         for i, r in enumerate(res):
             if r.converged:

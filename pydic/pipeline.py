@@ -7,7 +7,7 @@ frame.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -62,6 +62,7 @@ class Dic2D:
         images: Sequence[ImageLike],
         seed_xy: Optional[Tuple[float, float]] = None,
         seed_search_radius: int = 80,
+        progress_callback: Optional[Callable[[int, int, int, int], None]] = None,
     ) -> List[Dic2DFrameResult]:
         """Track the whole grid across `images` (deformed frames, in order).
 
@@ -70,6 +71,9 @@ class Dic2D:
         used only to bootstrap a coarse initial guess when the first
         deformed frame already involves large motion. Leave as None for the
         common case where frame 1 is close to the reference.
+        progress_callback: optional callback(frame_idx, n_frames, n_done,
+            n_total_points) — this can take a while on a large grid, so a
+            GUI can use this to show real progress instead of a bare spinner.
         """
         if self.ref_image is None:
             raise RuntimeError("call set_reference() first")
@@ -89,7 +93,7 @@ class Dic2D:
         raw = track_sequence(
             self.ref_image, frames, self.points, self.neighbors, self.subset_radius,
             first_frame_seed_indices=first_seed_indices, first_frame_seed_p=first_seed_p,
-            **self.track_kwargs,
+            frame_progress_callback=progress_callback, **self.track_kwargs,
         )
         self._results = raw
         out = []
@@ -157,8 +161,13 @@ class StereoDic:
             raise RuntimeError("no grid points generated: check ROI / subset_radius / grid_step")
 
     def run_sequence(
-        self, images1: Sequence[ImageLike], images2: Sequence[ImageLike]
+        self,
+        images1: Sequence[ImageLike],
+        images2: Sequence[ImageLike],
+        progress_callback: Optional[Callable[[str, int, int, int, int], None]] = None,
     ) -> List[StereoFrameResult]:
+        """progress_callback: optional callback(stage, frame_idx, n_frames,
+        n_done, n_total_points), stage being "camera1" or "camera2"."""
         if self.ref_img1 is None:
             raise RuntimeError("call set_reference() first")
         frames1 = [load_gray(im) for im in images1]
@@ -168,6 +177,7 @@ class StereoDic:
             self.calib, self.ref_img1, self.ref_img2, frames1, frames2,
             self.points1, self.neighbors, subset_radius=self.subset_radius,
             stereo_match_kwargs=self.stereo_match_kwargs, track_kwargs=self.track_kwargs,
+            progress_callback=progress_callback,
         )
         return frame_results
 

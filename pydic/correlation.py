@@ -26,24 +26,67 @@ def image_gradients(gray: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
 
 
 class ImageInterpolator:
-    """Bicubic spline over a full grayscale image, built once and reused for
-    every subset evaluated against that (deformed) frame."""
+    """Bicubic-spline sampler over a grayscale image.
+
+    Builds small *local* splines on demand (see `local_patch`) rather than
+    one spline over the whole frame: scipy's RectBivariateSpline evaluation
+    cost scales with the spline's total knot count, i.e. with the *whole
+    image's* resolution, regardless of how few points you evaluate — so on
+    a multi-megapixel frame, evaluating a 31x31 subset window thousands of
+    times against one global spline is dramatically (5-10x+) slower than
+    building a small spline just for the neighborhood each subset actually
+    needs. Bicubic interpolation with s=0 is exact and has local support, so
+    a local crop reproduces the same values as the global spline away from
+    its own edges — `local_patch` keeps evaluation points a safe margin from
+    the crop boundary and re-crops if the warp drifts past it.
+    """
 
     def __init__(self, gray: np.ndarray):
-        h, w = gray.shape
-        ys = np.arange(h, dtype=np.float64)
-        xs = np.arange(w, dtype=np.float64)
-        self._spline = RectBivariateSpline(ys, xs, gray.astype(np.float64), kx=3, ky=3)
-        self.shape = (h, w)
-
-    def eval(self, x: np.ndarray, y: np.ndarray) -> np.ndarray:
-        return self._spline.ev(y, x)
+        self.image = np.ascontiguousarray(gray, dtype=np.float64)
+        self.shape = self.image.shape
 
     def in_bounds(self, x: np.ndarray, y: np.ndarray, margin: float = 2.0) -> np.ndarray:
         h, w = self.shape
         return (
             (x >= margin) & (x <= w - 1 - margin) & (y >= margin) & (y <= h - 1 - margin)
         )
+
+    def _build_local_spline(self, x_center: float, y_center: float, half_size: int):
+        h, w = self.shape
+        xi, yi = int(round(x_center)), int(round(y_center))
+        x0, x1 = max(0, xi - half_size), min(w, xi + half_size + 1)
+        y0, y1 = max(0, yi - half_size), min(h, yi + half_size + 1)
+        xs = np.arange(x0, x1, dtype=np.float64)
+        ys = np.arange(y0, y1, dtype=np.float64)
+        spline = RectBivariateSpline(ys, xs, self.image[y0:y1, x0:x1], kx=3, ky=3)
+        return spline, (x0, x1, y0, y1)
+
+    def local_patch(self, x_center: float, y_center: float, half_size: int = 40) -> "LocalPatch":
+        """A small cached spline valid near (x_center, y_center), reused
+        across an IC-GN point's iterations instead of rebuilding every time."""
+        spline, bounds = self._build_local_spline(x_center, y_center, half_size)
+        return LocalPatch(self, spline, bounds, half_size)
+
+
+class LocalPatch:
+    """A local spline crop, auto-recentering if queried outside its margin."""
+
+    _EDGE_MARGIN = 3.0
+
+    def __init__(self, parent: ImageInterpolator, spline, bounds, half_size: int):
+        self._parent = parent
+        self._spline = spline
+        self._bounds = bounds
+        self._half_size = half_size
+
+    def eval(self, x: np.ndarray, y: np.ndarray) -> np.ndarray:
+        x0, x1, y0, y1 = self._bounds
+        m = self._EDGE_MARGIN
+        if np.any(x < x0 + m) or np.any(x > x1 - 1 - m) or np.any(y < y0 + m) or np.any(y > y1 - 1 - m):
+            self._spline, self._bounds = self._parent._build_local_spline(
+                float(np.mean(x)), float(np.mean(y)), self._half_size
+            )
+        return self._spline.ev(y, x)
 
 
 @dataclass
@@ -75,6 +118,13 @@ def icgn_correlate(
     converged = False
     zncc = -1.0
 
+    # A local spline sized to comfortably contain the subset plus some drift
+    # across iterations is far cheaper to build+query than repeatedly
+    # evaluating one spline fit over the whole frame (see ImageInterpolator).
+    patch = interpolator.local_patch(
+        subset.x0 + p_init[0], subset.y0 + p_init[3], half_size=subset.radius + 25
+    )
+
     for n_iter in range(1, max_iter + 1):
         M = params_to_matrix(p)
         xw = subset.x0 + M[0, 0] * subset.dx + M[0, 1] * subset.dy + M[0, 2]
@@ -83,7 +133,7 @@ def icgn_correlate(
         if not np.all(interpolator.in_bounds(xw, yw)):
             return CorrelationResult(p, -1.0, False, n_iter)
 
-        g = interpolator.eval(xw, yw)
+        g = patch.eval(xw, yw)
         g_mean = g.mean()
         g_tilde = g - g_mean
         delta_g = float(np.sqrt(np.sum(g_tilde ** 2)))

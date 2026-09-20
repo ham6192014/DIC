@@ -16,6 +16,13 @@ import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 import streamlit as st
+from PIL import Image
+
+try:
+    from streamlit_cropper import st_cropper
+    _HAS_CROPPER = True
+except ImportError:
+    _HAS_CROPPER = False
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -128,15 +135,65 @@ def chessboard_diagnostics(paths, pattern_size, key: str):
             st.image(thumb, caption=f"{'OK' if r['found'] else 'FAILED'}: {name}")
 
 
+def diagnose_result(valid: np.ndarray, disp_magnitude: np.ndarray, is_3d: bool = False) -> None:
+    """Turn a suspicious run (near-zero convergence, or zero displacement
+    everywhere) into an actionable message instead of a silent "it ran"."""
+    valid_frac = float(valid.mean()) if len(valid) else 0.0
+    if valid_frac < 0.05:
+        st.error(
+            "Almost nothing converged. Most likely causes: the ROI doesn't "
+            "actually cover the speckled/textured region (use the crop box "
+            "above to check — a flat/dark/untextured area has nothing to "
+            "correlate), the subset radius is too small or too large "
+            "relative to the speckle size, or the ZNCC threshold is too "
+            "strict. Try lowering the ZNCC threshold and re-checking the ROI."
+        )
+        return
+    max_disp = float(np.nanmax(disp_magnitude[valid])) if np.any(valid) else 0.0
+    if max_disp < 0.03:
+        unit = "mm" if is_3d else "px"
+        st.warning(
+            f"{valid_frac*100:.0f}% of points converged, but the largest "
+            f"displacement found is only {max_disp:.4f} {unit} — essentially "
+            "zero. If you expected visible deformation between the "
+            "reference and this frame, check that the ROI covers the part "
+            "of the specimen that actually moves (not a static background, "
+            "fixture, or pedestal), and that this frame really is a "
+            "different, later image than the reference."
+        )
+
+
 def roi_bbox_picker(image: np.ndarray, key: str):
     h, w = image.shape[:2]
-    st.image(image, caption="Reference image", clamp=True, width="stretch")
     use_roi = st.checkbox("Restrict to a rectangular ROI", key=f"{key}_use_roi")
     if not use_roi:
+        st.image(image, caption="Reference image (full frame will be used)", clamp=True, width="stretch")
         return None
-    c1, c2 = st.columns(2)
-    x0, x1 = c1.slider("x range", 0, w, (0, w), key=f"{key}_x")
-    y0, y1 = c2.slider("y range", 0, h, (0, h), key=f"{key}_y")
+
+    if _HAS_CROPPER:
+        st.caption("Drag the corners/edges of the box below to select the region to correlate (e.g. just the speckled patch).")
+        pil_img = Image.fromarray(image).convert("RGB")
+        box = st_cropper(
+            pil_img, realtime_update=True, box_color="#2f6fed",
+            aspect_ratio=None, return_type="box", key=f"{key}_cropper",
+        )
+        x0, y0 = int(box["left"]), int(box["top"])
+        x1, y1 = x0 + int(box["width"]), y0 + int(box["height"])
+        x0, y0 = max(0, x0), max(0, y0)
+        x1, y1 = min(w, x1), min(h, y1)
+        crop_preview = image[y0:y1, x0:x1]
+        if crop_preview.size:
+            st.image(crop_preview, caption=f"Selected ROI preview ({x1-x0}x{y1-y0} px) — check it actually covers the speckled/textured area", width="stretch")
+    else:
+        st.image(image, caption="Reference image", clamp=True, width="stretch")
+        st.info("Install `streamlit-cropper` for a drag-to-select box (pip install streamlit-cropper); falling back to numeric sliders.")
+        c1, c2 = st.columns(2)
+        x0, x1 = c1.slider("x range", 0, w, (0, w), key=f"{key}_x")
+        y0, y1 = c2.slider("y range", 0, h, (0, h), key=f"{key}_y")
+        crop_preview = image[y0:y1, x0:x1]
+        if crop_preview.size:
+            st.image(crop_preview, caption=f"Selected ROI preview ({x1-x0}x{y1-y0} px)", width="stretch")
+
     return [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
 
 
@@ -254,10 +311,20 @@ def dic2d_tab():
         roi = roi_bbox_picker(load_gray(ref_paths[0]), "d2_roi")
 
     if st.button("Run 2D DIC", disabled=not (ref_paths and seq_paths)):
-        with st.spinner(f"Tracking {len(seq_paths)} frame(s)..."):
-            dic = Dic2D(subset_radius=int(subset_radius), grid_step=int(grid_step), zncc_threshold=float(zncc_thr))
-            dic.set_reference(ref_paths[0], roi_polygon=roi)
-            results = dic.run_sequence(seq_paths)
+        dic = Dic2D(subset_radius=int(subset_radius), grid_step=int(grid_step), zncc_threshold=float(zncc_thr))
+        dic.set_reference(ref_paths[0], roi_polygon=roi)
+        n_frames = len(seq_paths)
+        progress_bar = st.progress(0.0, text=f"Tracking frame 1/{n_frames}...")
+
+        def _on_progress(frame_idx, n_frames_, n_done, n_total):
+            frac = (frame_idx + n_done / max(n_total, 1)) / max(n_frames_, 1)
+            progress_bar.progress(
+                min(frac, 1.0),
+                text=f"Tracking frame {frame_idx + 1}/{n_frames_}: {n_done}/{n_total} points",
+            )
+
+        results = dic.run_sequence(seq_paths, progress_callback=_on_progress)
+        progress_bar.empty()
         st.session_state["dic2d"] = dic
         st.session_state["dic2d_results"] = results
         st.success(f"Done: {len(dic.points)} points x {len(results)} frame(s).")
@@ -272,6 +339,8 @@ def dic2d_tab():
         strain = dic.compute_strain(frame, window_hops=int(strain_hops))
 
         st.metric("Converged fraction", f"{frame.valid.mean()*100:.1f}%")
+        disp_mag = np.sqrt(frame.u ** 2 + frame.v ** 2)
+        diagnose_result(frame.valid, disp_mag, is_3d=False)
 
         field = st.selectbox(
             "Field to display", ["displacement (u, v)", "exx", "eyy", "exy", "major principal", "von Mises"],
@@ -335,14 +404,28 @@ def stereo_dic_tab():
         if len(seq1) != len(seq2):
             st.error(f"Camera-1 ({len(seq1)}) and camera-2 ({len(seq2)}) sequence lengths differ.")
         else:
-            with st.spinner(f"Matching + tracking {len(seq1)} frame(s)..."):
-                dic = StereoDic(
-                    calib, subset_radius=int(subset_radius), grid_step=int(grid_step),
-                    zncc_threshold=float(zncc_thr), epipolar_band=float(epi_band),
-                    disparity_range=(float(disp_min), float(disp_max)),
-                )
+            dic = StereoDic(
+                calib, subset_radius=int(subset_radius), grid_step=int(grid_step),
+                zncc_threshold=float(zncc_thr), epipolar_band=float(epi_band),
+                disparity_range=(float(disp_min), float(disp_max)),
+            )
+            with st.spinner("Matching left/right cameras at the reference frame..."):
                 dic.set_reference(ref1[0], ref2[0], roi_polygon=roi)
-                frame_results = dic.run_sequence(seq1, seq2)
+
+            n_frames = len(seq1)
+            progress_bar = st.progress(0.0, text="Tracking...")
+
+            def _on_progress(stage, frame_idx, n_frames_, n_done, n_total):
+                stage_label = "camera 1" if stage == "camera1" else "camera 2"
+                stage_offset = 0 if stage == "camera1" else 1
+                frac = (stage_offset + (frame_idx + n_done / max(n_total, 1)) / max(n_frames_, 1)) / 2
+                progress_bar.progress(
+                    min(frac, 1.0),
+                    text=f"Tracking {stage_label}, frame {frame_idx + 1}/{n_frames_}: {n_done}/{n_total} points",
+                )
+
+            frame_results = dic.run_sequence(seq1, seq2, progress_callback=_on_progress)
+            progress_bar.empty()
             st.session_state["stereo_dic"] = dic
             st.session_state["stereo_dic_results"] = frame_results
             st.success(f"Done: {len(dic.points1)} points x {len(frame_results)} frame(s).")
@@ -358,6 +441,8 @@ def stereo_dic_tab():
         strain = dic.compute_strain(fr)
 
         st.metric("Valid fraction", f"{fr.valid.mean()*100:.1f}%")
+        disp_mag = np.linalg.norm(fr.displacement_3d, axis=1)
+        diagnose_result(fr.valid, disp_mag, is_3d=True)
 
         field = st.selectbox(
             "Field to display",

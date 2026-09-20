@@ -10,7 +10,7 @@ optimizer used for temporal tracking.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -167,6 +167,7 @@ def track_stereo_sequence(
     subset_radius: int = 15,
     stereo_match_kwargs: Optional[dict] = None,
     track_kwargs: Optional[dict] = None,
+    progress_callback: Optional[Callable[[str, int, int, int, int], None]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, List[StereoFrameResult]]:
     """Full stereo-DIC pipeline: match cameras at reference, then track and
     triangulate every frame of a synchronized (frames1[t], frames2[t]) pair.
@@ -175,6 +176,11 @@ def track_stereo_sequence(
     connectivity in camera 1's reference image (see fields.generate_grid /
     fields.build_neighbors); the same connectivity is reused for camera 2's
     tracking since points2[i] corresponds 1:1 to points1[i].
+
+    progress_callback: optional callback(stage, frame_idx, n_frames, n_done,
+        n_total_points) where stage is "camera1" or "camera2" — tracking two
+        full sequences on a large grid can take a while, so a GUI can use
+        this instead of a bare spinner.
     """
     stereo_match_kwargs = stereo_match_kwargs or {}
     track_kwargs = track_kwargs or {}
@@ -185,8 +191,14 @@ def track_stereo_sequence(
     ref_points_3d = triangulate_points(calib, points1, points2)
     ref_points_3d[~stereo_valid] = np.nan
 
-    results1 = track_sequence(ref_img1, frames1, points1, neighbors, subset_radius, **track_kwargs)
-    results2 = track_sequence(ref_img2, frames2, points2, neighbors, subset_radius, **track_kwargs)
+    cb1 = (lambda fi, nf, nd, nt: progress_callback("camera1", fi, nf, nd, nt)) if progress_callback else None
+    cb2 = (lambda fi, nf, nd, nt: progress_callback("camera2", fi, nf, nd, nt)) if progress_callback else None
+    results1 = track_sequence(
+        ref_img1, frames1, points1, neighbors, subset_radius, frame_progress_callback=cb1, **track_kwargs
+    )
+    results2 = track_sequence(
+        ref_img2, frames2, points2, neighbors, subset_radius, frame_progress_callback=cb2, **track_kwargs
+    )
 
     frame_results: List[StereoFrameResult] = []
     n = len(points1)
